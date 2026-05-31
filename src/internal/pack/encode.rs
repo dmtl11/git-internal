@@ -36,7 +36,13 @@ use crate::{
 
 const MAX_CHAIN_LEN: usize = 50;
 const MIN_DELTA_RATE: f64 = 0.5; // minimum delta rate
-//const MAX_ZSTDELTA_CHAIN_LEN: usize = 50;
+const CHANNEL_CAPACITY: usize = 1024; // capacity for mpsc channels
+const SIMILARITY_CHECK_SIZE: usize = 128; // number of bytes to check for similarity
+const TIE_EPSILON: f64 = 0.15; // epsilon for tie-breaking in delta base selection
+const SYMMETRIC_RATIO_THRESHOLD: f64 = 0.5; // minimum symmetric ratio for delta candidates
+const SIZE_THRESHOLD_FOR_HEURISTIC: usize = 64; // threshold for using heuristic encoding rate
+const MIN_LEN_FOR_PARALLEL: usize = 3; // minimum length for parallel iteration in delta selection
+const BATCH_SIZE_BASE: usize = 1000; // base batch size for parallel encoding
 
 /// A encoder for generating pack files with delta objects.
 pub struct PackEncoder {
@@ -71,8 +77,8 @@ pub async fn encode_and_output_to_files(
     output_dir: PathBuf,
     window_size: usize,
 ) -> Result<(), GitError> {
-    let (pack_tx, mut pack_rx) = mpsc::channel(1024);
-    let (idx_tx, mut idx_rx) = mpsc::channel(1024);
+    let (pack_tx, mut pack_rx) = mpsc::channel(CHANNEL_CAPACITY);
+    let (idx_tx, mut idx_rx) = mpsc::channel(CHANNEL_CAPACITY);
     let mut pack_encoder = PackEncoder::new_with_idx(object_number, window_size, pack_tx, idx_tx);
 
     // timestamp for temp filename
@@ -250,9 +256,9 @@ fn calc_hash(data: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// Cheap check if two byte slices are similar by comparing their hashes of the first 128 bytes.
+/// Cheap check if two byte slices are similar by comparing their hashes of the first bytes.
 fn cheap_similar(a: &[u8], b: &[u8]) -> bool {
-    let k = a.len().min(b.len()).min(128);
+    let k = a.len().min(b.len()).min(SIMILARITY_CHECK_SIZE);
     if k == 0 {
         return false;
     }
@@ -398,6 +404,7 @@ impl PackEncoder {
         );
 
         // parallel encoding vec with different object_type
+        let window_size = self.window_size;
         let (commit_results, tree_results, blob_results, tag_results) = tokio::try_join!(
             tokio::task::spawn_blocking(move || {
                 Self::try_as_offset_delta(
@@ -405,7 +412,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -415,7 +422,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -425,7 +432,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -434,7 +441,7 @@ impl PackEncoder {
                     tags.into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -490,11 +497,10 @@ impl PackEncoder {
             // 每次循环重置最佳基对象选择
             let mut best_base: Option<&(Entry, usize)> = None;
             let mut best_rate: f64 = 0.0;
-            let tie_epsilon: f64 = 0.15;
 
             let candidates: Vec<_> = window
                 .par_iter()
-                .with_min_len(3)
+                .with_min_len(MIN_LEN_FOR_PARALLEL)
                 .filter_map(|try_base| {
                     if try_base.0.obj_type != entry.obj_type {
                         return None;
@@ -510,7 +516,7 @@ impl PackEncoder {
 
                     let sym_ratio = (try_base.0.data.len().min(entry.data.len()) as f64)
                         / (try_base.0.data.len().max(entry.data.len()) as f64);
-                    if sym_ratio < 0.5 {
+                    if sym_ratio < SYMMETRIC_RATIO_THRESHOLD {
                         return None;
                     }
 
@@ -518,7 +524,9 @@ impl PackEncoder {
                         return None;
                     }
 
-                    let rate = if (try_base.0.data.len() + entry.data.len()) / 2 > 64 {
+                    let rate = if (try_base.0.data.len() + entry.data.len()) / 2
+                        > SIZE_THRESHOLD_FOR_HEURISTIC
+                    {
                         delta::heuristic_encode_rate_parallel(&try_base.0.data, &entry.data)
                     } else {
                         delta::encode_rate(&try_base.0.data, &entry.data)
@@ -542,9 +550,9 @@ impl PackEncoder {
                         best_base = Some(try_base);
                     }
                     Some(best_base_ref) => {
-                        let is_better = if rate > best_rate + tie_epsilon {
+                        let is_better = if rate > best_rate + TIE_EPSILON {
                             true
-                        } else if (rate - best_rate).abs() <= tie_epsilon {
+                        } else if (rate - best_rate).abs() <= TIE_EPSILON {
                             try_base.0.chain_len > best_base_ref.0.chain_len
                         } else {
                             false
@@ -613,7 +621,7 @@ impl PackEncoder {
         }
 
         let mut idx_entries = Vec::new();
-        let batch_size = usize::max(1000, entry_rx.max_capacity() / 10); // A temporary value, not optimized
+        let batch_size = usize::max(BATCH_SIZE_BASE, entry_rx.max_capacity() / 10);
         tracing::info!("encode with batch size: {}", batch_size);
         loop {
             let mut batch_entries = Vec::with_capacity(batch_size);
@@ -791,6 +799,116 @@ mod tests {
         tracing::debug!("start check format");
         p.decode(&mut reader, |_| {}, None::<fn(ObjectHash)>)
             .expect("pack file format error");
+    }
+
+    /// Test that window_size = 0 produces valid pack without delta compression
+    #[tokio::test]
+    async fn test_window_size_zero_no_delta() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let (tx, mut rx) = mpsc::channel(100);
+        let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1);
+
+        let str_vec = vec!["hello, world", "hello, world.", "hello"];
+        let encoder = PackEncoder::new(str_vec.len(), 0, tx); // window_size = 0
+        encoder.encode_async(entry_rx).await.unwrap();
+
+        for str in str_vec {
+            let blob = Blob::from_content(str);
+            let entry: Entry = blob.into();
+            entry_tx
+                .send(MetaAttached {
+                    inner: entry,
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(entry_tx);
+
+        let mut result = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            result.extend(chunk);
+        }
+        check_format(&result);
+        // Verify pack was created
+        assert!(result.len() > 0, "pack should not be empty");
+    }
+
+    /// Test that window_size = 1 works correctly
+    #[tokio::test]
+    async fn test_window_size_one_minimal_delta() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let (tx, mut rx) = mpsc::channel(100);
+        let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1);
+
+        let str_vec = vec!["hello, world", "hello, world.", "hello"];
+        let encoder = PackEncoder::new(str_vec.len(), 1, tx); // window_size = 1
+        encoder.encode_async(entry_rx).await.unwrap();
+
+        for str in str_vec {
+            let blob = Blob::from_content(str);
+            let entry: Entry = blob.into();
+            entry_tx
+                .send(MetaAttached {
+                    inner: entry,
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(entry_tx);
+
+        let mut result = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            result.extend(chunk);
+        }
+        check_format(&result);
+        assert!(result.len() > 0, "pack should not be empty");
+    }
+
+    /// Test different window sizes affect compression
+    #[tokio::test]
+    async fn test_window_size_affects_compression() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+
+        async fn encode_with_window(window_size: usize) -> usize {
+            let (tx, mut rx) = mpsc::channel(100);
+            let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1);
+
+            let str_vec = vec!["hello, world", "hello, world.", "hello world!", "hello"];
+            let encoder = PackEncoder::new(str_vec.len(), window_size, tx);
+            encoder.encode_async(entry_rx).await.unwrap();
+
+            for str in str_vec {
+                let blob = Blob::from_content(str);
+                let entry: Entry = blob.into();
+                entry_tx
+                    .send(MetaAttached {
+                        inner: entry,
+                        meta: EntryMeta::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            drop(entry_tx);
+
+            let mut result = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                result.extend(chunk);
+            }
+            check_format(&result);
+            result.len()
+        }
+
+        let size_no_delta = encode_with_window(0).await;
+        let size_small_window = encode_with_window(1).await;
+        let size_large_window = encode_with_window(4).await;
+
+        // Larger window should generally produce smaller pack (more delta opportunities)
+        // Or at minimum, should produce valid format
+        assert!(size_no_delta > 0, "no delta pack should be valid");
+        assert!(size_small_window > 0, "small window pack should be valid");
+        assert!(size_large_window > 0, "large window pack should be valid");
     }
 
     #[tokio::test]

@@ -489,7 +489,7 @@ impl PackEncoder {
     ) -> Result<Vec<(Vec<u8>, IndexEntry)>, GitError> {
         let mut current_offset = 0usize;
         let mut window: VecDeque<(Entry, usize)> = VecDeque::with_capacity(window_size);
-        let mut res: Vec<(Vec<u8>, IndexEntry)> = Vec::new();
+        let mut res: Vec<(Vec<u8>, IndexEntry)> = Vec::with_capacity(bucket.len());
         //let mut idx_entries: Vec<IndexEntry> = Vec::new();
 
         for entry in bucket.iter_mut() {
@@ -588,12 +588,13 @@ impl PackEncoder {
 
             entry_for_window.chain_len = entry.chain_len;
             let obj_data = encode_one_object(entry, offset)?;
+            let obj_len = obj_data.len();
             window.push_back((entry_for_window, current_offset));
             if window.len() > window_size {
                 window.pop_front();
             }
-            res.push((obj_data.clone(), IndexEntry::new(entry, 0)));
-            current_offset += obj_data.len();
+            res.push((obj_data, IndexEntry::new(entry, 0)));
+            current_offset += obj_len;
         }
         Ok(res)
     }
@@ -799,6 +800,111 @@ mod tests {
         tracing::debug!("start check format");
         p.decode(&mut reader, |_| {}, None::<fn(ObjectHash)>)
             .expect("pack file format error");
+    }
+
+    /// Test Vec preallocation optimization produces correct pack
+    #[tokio::test]
+    async fn test_vec_preallocation_optimization() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+        let (tx, mut rx) = mpsc::channel(100);
+        let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1);
+
+        // Create 100 similar objects to test preallocation
+        let mut str_vec = Vec::new();
+        for i in 0..100 {
+            let obj = match i % 3 {
+                0 => "test object one for preallocation",
+                1 => "test object two for preallocation",
+                _ => "test object three for preallocation",
+            };
+            str_vec.push(obj);
+        }
+
+        let encoder = PackEncoder::new(str_vec.len(), 10, tx);
+        encoder.encode_async(entry_rx).await.unwrap();
+
+        for obj in str_vec {
+            let blob = Blob::from_content(obj);
+            let entry: Entry = blob.into();
+            entry_tx
+                .send(MetaAttached {
+                    inner: entry,
+                    meta: EntryMeta::new(),
+                })
+                .await
+                .unwrap();
+        }
+        drop(entry_tx);
+
+        let mut result = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            result.extend(chunk);
+        }
+
+        check_format(&result);
+        assert!(
+            result.len() > 0,
+            "pack should be created successfully with preallocation"
+        );
+
+        // Verify pack can be decoded successfully (verifies preallocation worked)
+        let mut pack = Pack::new(None, Some(64 * 1024 * 1024), None, true);
+        let mut reader = std::io::Cursor::new(&result);
+        pack.decode(&mut reader, |_entry| {}, None::<fn(ObjectHash)>)
+            .expect("pack with preallocation should decode successfully");
+    }
+
+    /// Test move optimization for obj_data preserves correctness
+    #[test]
+    fn test_move_optimization_correctness() {
+        let str_vec = vec![
+            "tiny",
+            "this is a medium size object for testing move optimization",
+            "This is a much larger object that should help verify the move optimization works correctly",
+        ];
+
+        // Create encoded pack to test move optimization
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async {
+            let _guard = set_hash_kind_for_test(HashKind::Sha1);
+            let (tx, mut rx) = mpsc::channel(100);
+            let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1);
+
+            let encoder = PackEncoder::new(str_vec.len(), 5, tx);
+            encoder.encode_async(entry_rx).await.unwrap();
+
+            for obj in str_vec.iter() {
+                let blob = Blob::from_content(obj);
+                let entry: Entry = blob.into();
+                entry_tx
+                    .send(MetaAttached {
+                        inner: entry,
+                        meta: EntryMeta::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            drop(entry_tx);
+
+            let mut result = Vec::new();
+            while let Some(chunk) = rx.recv().await {
+                result.extend(chunk);
+            }
+            result
+        });
+
+        // Verify pack was created and is valid
+        check_format(&result);
+        assert!(
+            result.len() > 0,
+            "pack should be created with move optimization"
+        );
+
+        // Verify pack can be decoded successfully
+        let mut pack = Pack::new(None, Some(64 * 1024 * 1024), None, true);
+        let mut reader = std::io::Cursor::new(&result);
+        pack.decode(&mut reader, |_entry| {}, None::<fn(ObjectHash)>)
+            .expect("pack with move optimization should decode successfully");
     }
 
     /// Test that window_size = 0 produces valid pack without delta compression
